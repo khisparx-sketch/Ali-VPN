@@ -1,0 +1,283 @@
+package com.alivpn.app
+
+import android.app.Activity
+import android.content.Intent
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.net.VpnService
+import android.net.Uri
+import android.os.Bundle
+import android.util.Base64
+import android.view.Gravity
+import android.view.animation.DecelerateInterpolator
+import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
+import com.wireguard.android.backend.GoBackend
+import com.wireguard.android.backend.Tunnel
+import com.wireguard.config.Config
+import java.io.ByteArrayInputStream
+import java.security.KeyStore
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import java.util.concurrent.Executors
+
+class MainActivity : Activity() {
+    private val bg = Color.rgb(35, 39, 45)
+    private val panel = Color.rgb(48, 53, 60)
+    private val accent = Color.rgb(160, 220, 215)
+    private val green = Color.rgb(67, 210, 125)
+    private val white = Color.rgb(239, 242, 245)
+    private val muted = Color.rgb(171, 180, 190)
+    private val worker = Executors.newSingleThreadExecutor()
+
+    private lateinit var status: TextView
+    private lateinit var profile: TextView
+    private lateinit var power: TextView
+    private lateinit var connect: Button
+    private lateinit var importButton: Button
+    private lateinit var ring: TextView
+    private var config: Config? = null
+    private var backend: GoBackend? = null
+    private var isConnected = false
+    private var isBusy = false
+
+    private val tunnel = object : Tunnel {
+        override fun getName() = "ali-vpn"
+        override fun onStateChange(newState: Tunnel.State) {
+            runOnUiThread { showState(newState == Tunnel.State.UP) }
+        }
+    }
+
+    private val picker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) importConfig(uri)
+    }
+    private val vpnPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (it.resultCode == Activity.RESULT_OK) connectTunnel()
+        else showMessage("VPN permission was not granted.")
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.statusBarColor = bg
+        window.navigationBarColor = bg
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(22, 22, 22, 24)
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(Color.rgb(43, 48, 55), Color.rgb(29, 33, 39), Color.rgb(51, 57, 64))
+            )
+        }
+        fun label(value: String, size: Float, color: Int, bold: Boolean = false) =
+            TextView(this).apply {
+                text = value; textSize = size; setTextColor(color); gravity = Gravity.CENTER
+                if (bold) setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                setPadding(8, 6, 8, 6)
+            }
+
+        root.addView(label("Ali VPN", 13f, muted, true))
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+            setPadding(18, 20, 18, 20); background = rounded(panel, 26)
+        }
+        val orbFrame = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(220, 220).apply { topMargin = 10; bottomMargin = 10 }
+        }
+        ring = label("", 1f, accent).apply {
+            background = ringDrawable()
+            layoutParams = FrameLayout.LayoutParams(202, 202, Gravity.CENTER)
+        }
+        power = label("⏻", 72f, accent, true).apply {
+            background = rounded(Color.rgb(58, 67, 73), 120)
+            elevation = 12f
+            layoutParams = FrameLayout.LayoutParams(144, 144, Gravity.CENTER)
+        }
+        orbFrame.addView(ring); orbFrame.addView(power); card.addView(orbFrame)
+        status = label("NOT CONNECTED", 15f, white, true)
+        profile = label("Import a WireGuard profile to begin", 11f, muted)
+        card.addView(status); card.addView(profile)
+        root.addView(card)
+
+        root.addView(label("FREE WIREGUARD CONFIGS", 11f, accent, true).apply {
+            setPadding(4, 18, 4, 7)
+        })
+        val providers = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(12, 8, 12, 8)
+            background = rounded(panel, 18)
+        }
+        providers.addView(providerRow("KretVPN", "Free temporary configs; provider limits apply", "https://kretvpn.com/en"))
+        providers.addView(providerRow("Generous VPN", "Free plan; create your own device profile", "https://generousvpn.com/"))
+        root.addView(providers)
+
+        importButton = Button(this).apply {
+            text = "IMPORT .CONF PROFILE"
+            setOnClickListener { picker.launch(arrayOf("*/*")) }
+        }
+        connect = Button(this).apply {
+            text = "CONNECT"
+            isEnabled = false
+            setOnClickListener { if (isConnected) disconnectTunnel() else requestVpnPermission() }
+        }
+        root.addView(importButton); root.addView(connect)
+        root.addView(label(
+            "No subscription or Pro tier. Server speed, availability and uptime depend on the independent provider. Use profiles only from providers you trust.",
+            10f, muted
+        ))
+        root.addView(label("FREE ACCESS  •  NO PRO OPTION", 10f, accent, true))
+        setContentView(ScrollView(this).apply { addView(root) })
+
+        loadSavedConfig()
+        startAmbientAnimation(ring)
+    }
+
+    private fun rounded(color: Int, radius: Int) = GradientDrawable().apply {
+        setColor(color); cornerRadius = radius.toFloat()
+    }
+    private fun ringDrawable() = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(3, accent)
+    }
+
+    private fun providerRow(name: String, subtitle: String, url: String): LinearLayout {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(8, 7, 8, 7) }
+        row.addView(TextView(this).apply {
+            text = name; textSize = 14f; setTextColor(white); setTypeface(null, Typeface.BOLD)
+        })
+        row.addView(TextView(this).apply { text = subtitle; textSize = 10f; setTextColor(muted) })
+        row.addView(TextView(this).apply {
+            text = "Open provider ↗"; textSize = 11f; setTextColor(accent)
+            setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+        })
+        return row
+    }
+
+    private fun importConfig(uri: Uri) {
+        try {
+            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: error("Cannot read selected file")
+            val parsed = Config.parse(ByteArrayInputStream(bytes))
+            require(parsed.peers.isNotEmpty()) { "This profile has no [Peer] server." }
+            config = parsed
+            saveEncrypted(String(bytes, Charsets.UTF_8))
+            profile.text = "WireGuard profile imported"
+            status.text = "PROFILE READY"
+            status.setTextColor(accent)
+            connect.isEnabled = true
+            showMessage("Profile imported. Tap CONNECT to start the VPN.")
+        } catch (e: Exception) {
+            showMessage("Import failed: ${e.message ?: "Invalid WireGuard profile"}")
+        }
+    }
+
+    private fun requestVpnPermission() {
+        val permissionIntent = VpnService.prepare(this)
+        if (permissionIntent != null) vpnPermission.launch(permissionIntent) else connectTunnel()
+    }
+
+    private fun connectTunnel() {
+        val selected = config ?: run { showMessage("Import a .conf profile first."); return }
+        setBusy(true)
+        worker.execute {
+            try {
+                if (backend == null) backend = GoBackend(applicationContext)
+                backend!!.setState(tunnel, Tunnel.State.UP, selected)
+                runOnUiThread { showState(true); setBusy(false) }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    showState(false); setBusy(false)
+                    showMessage("Connection failed: ${e.message ?: e.javaClass.simpleName}")
+                }
+            }
+        }
+    }
+
+    private fun disconnectTunnel() {
+        setBusy(true)
+        worker.execute {
+            try {
+                backend?.setState(tunnel, Tunnel.State.DOWN, null)
+                runOnUiThread { showState(false); setBusy(false) }
+            } catch (e: Exception) {
+                runOnUiThread { setBusy(false); showMessage("Disconnect error: ${e.message}") }
+            }
+        }
+    }
+
+    private fun showState(connected: Boolean) {
+        isConnected = connected
+        status.text = if (connected) "VPN CONNECTED" else if (config != null) "PROFILE READY" else "NOT CONNECTED"
+        status.setTextColor(if (connected) green else if (config != null) accent else white)
+        power.setTextColor(if (connected) green else accent)
+        power.text = if (connected) "✓" else "⏻"
+        connect.text = if (connected) "DISCONNECT" else "CONNECT"
+        connect.isEnabled = config != null && !isBusy
+    }
+
+    private fun setBusy(busy: Boolean) {
+        isBusy = busy
+        connect.isEnabled = !busy && config != null
+        if (busy) { status.text = "PLEASE WAIT…"; status.setTextColor(muted) }
+    }
+
+    private fun showMessage(message: String) =
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+
+    private fun startAmbientAnimation(view: TextView) {
+        view.animate().alpha(0.45f).scaleX(1.04f).scaleY(1.04f)
+            .setDuration(1700).setInterpolator(DecelerateInterpolator())
+            .withEndAction {
+                view.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                    .setDuration(1700).withEndAction { startAmbientAnimation(view) }.start()
+            }.start()
+    }
+
+    // Encrypt the imported profile at rest with a non-exportable Android Keystore AES key.
+    private fun secretKey(): SecretKey {
+        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (store.getKey("AliVpnConfigKey", null) as? SecretKey)?.let { return it }
+        val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        generator.init(KeyGenParameterSpec.Builder(
+            "AliVpnConfigKey", KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).setRandomizedEncryptionRequired(true).build())
+        return generator.generateKey()
+    }
+
+    private fun saveEncrypted(value: String) {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey())
+        val encrypted = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+        val packed = cipher.iv + encrypted
+        getSharedPreferences("secure_profile", MODE_PRIVATE).edit()
+            .putString("profile", Base64.encodeToString(packed, Base64.NO_WRAP)).apply()
+    }
+
+    private fun loadSavedConfig() {
+        try {
+            val encoded = getSharedPreferences("secure_profile", MODE_PRIVATE).getString("profile", null) ?: return
+            val packed = Base64.decode(encoded, Base64.NO_WRAP)
+            val iv = packed.copyOfRange(0, 12)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(128, iv))
+            val plain = cipher.doFinal(packed.copyOfRange(12, packed.size))
+            config = Config.parse(ByteArrayInputStream(plain))
+            profile.text = "Saved WireGuard profile ready"
+            status.text = "PROFILE READY"; status.setTextColor(accent)
+            connect.isEnabled = true
+        } catch (_: Exception) {
+            getSharedPreferences("secure_profile", MODE_PRIVATE).edit().remove("profile").apply()
+            showMessage("Saved profile could not be opened. Please import it again.")
+        }
+    }
+
+    override fun onDestroy() {
+        worker.shutdown()
+        super.onDestroy()
+    }
+}

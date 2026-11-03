@@ -1,0 +1,20 @@
+# Ali VPN
+
+Free Android WireGuard client. No Pro tier, no subscription screen, and no bundled third-party server credentials.
+
+## Build
+The GitHub Actions workflow builds a debug APK on every push to `main` and on manual dispatch. Download the APK from the workflow run's Artifacts section.
+
+## Use
+1. Install the APK on Android 8.0+.
+2. Obtain a WireGuard `.conf` profile from a provider you trust (for example, use the provider links shown in the app).
+3. Import the `.conf` profile.
+4. Tap CONNECT and approve Android's VPN permission dialog.
+
+Profiles are encrypted at rest with an Android Keystore AES-GCM key. The private key remains on-device and is not uploaded by this app.
+
+## Important limitations
+- This app is a WireGuard client, not a VPN server operator. It does not provide its own VPN endpoints.
+- Provider free tiers, server availability, speed, data limits, and privacy policies are controlled by the provider and may change. Unlimited speed, universal uptime, and zero disconnections cannot be promised.
+- The app currently connects using an imported profile. Automatic recovery after every possible Android process kill/network transition is not guaranteed; use Android's system VPN settings only if you understand the always-on/lockdown implications.
+- This first cloud build is a debug APK, not a Play Store-signed release.
